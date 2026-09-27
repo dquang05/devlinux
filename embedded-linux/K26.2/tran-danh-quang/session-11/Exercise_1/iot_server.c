@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -73,6 +74,8 @@ static int init_clients(client_t clients[], size_t count) {
         clients[i].client_id = 0;
         clients[i].ip[0] = '\0';
         clients[i].port = 0;
+        clients[i].rx_len = 0;
+        memset(clients[i].rx_buf, 0, sizeof(clients[i].rx_buf));
     }
     return 0;
 }
@@ -225,6 +228,9 @@ static int handle_new_connection(int server_fd, client_t clients[], size_t max_c
     clients[slot].fd = client_fd;
     clients[slot].mode = MODE_IDLE;
     clients[slot].client_id = (*next_id)++;
+    clients[slot].rx_len = 0;
+    memset(clients[slot].rx_buf, 0, sizeof(clients[slot].rx_buf));
+
     time_t now = time(NULL);
     if (now == (time_t)-1) {
         perror("time");
@@ -237,9 +243,9 @@ static int handle_new_connection(int server_fd, client_t clients[], size_t max_c
         strncpy(clients[slot].ip, "unknown", sizeof(clients[slot].ip) - 1);
         clients[slot].ip[sizeof(clients[slot].ip) - 1] = '\0';
     }
-    clients[slot].port = (int)ntohs(cli_addr.sin_port);
+    clients[slot].port = ntohs(cli_addr.sin_port);
 
-    if (printf("[Server] Client %d connected from %s:%d\n",
+    if (printf("[Server] Client %d connected from %s:%u\n",
                clients[slot].client_id, clients[slot].ip, clients[slot].port) < 0) {
         perror("printf");
     }
@@ -331,19 +337,30 @@ static int process_client_command(client_t *client, const char *cmd) {
 }
 
 /*
- * Handle incoming data from an existing client socket.
- * Returns 0 on success, -1 on failure.
+ * Handle incoming stream data from an existing client socket.
+ * Accumulates data into linear rx_buf and extracts complete newline-delimited commands.
+ * Returns 0 on success, -1 on fatal error.
  */
 static int handle_client_data(client_t *client) {
-    char buf[BUFFER_SIZE];
-    memset(buf, 0, sizeof(buf));
+    if (client->rx_len >= sizeof(client->rx_buf) - 1) {
+        /* Buffer full without delimiter: reset to prevent stall */
+        client->rx_len = 0;
+        memset(client->rx_buf, 0, sizeof(client->rx_buf));
+    }
 
-    ssize_t bytes_read = recv(client->fd, buf, sizeof(buf) - 1, 0);
+    size_t avail = sizeof(client->rx_buf) - 1 - client->rx_len;
+    ssize_t bytes_read = recv(client->fd, client->rx_buf + client->rx_len, avail, 0);
+
     if (bytes_read <= 0) {
-        if (bytes_read < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return 0;
+        if (bytes_read < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
+            /* Client error: clear buffer to avoid stale data */
+            memset(client->rx_buf, 0, sizeof(client->rx_buf));
+            client->rx_len = 0;
         }
-        /* Client disconnected or error */
+        /* Client disconnected */
         if (printf("[Server] Client %d disconnected.\n", client->client_id) < 0) {
             perror("printf");
         }
@@ -354,42 +371,69 @@ static int handle_client_data(client_t *client) {
             perror("close client socket");
         }
         client->fd = -1;
+        client->rx_len = 0;
         return 0;
     }
 
-    buf[bytes_read] = '\0';
+    client->rx_len += (size_t)bytes_read;
+    client->rx_buf[client->rx_len] = '\0';
+
     time_t now = time(NULL);
     if (now != (time_t)-1) {
         client->last_activity = now;
     }
 
-    /* Parse command line by line */
-    char *saveptr = NULL;
-    char *line = strtok_r(buf, "\r\n", &saveptr);
-    while (line != NULL) {
-        /* Trim leading/trailing whitespace */
-        while (*line == ' ' || *line == '\t') {
-            line++;
-        }
-        size_t line_len = strlen(line);
-        while (line_len > 0 && (line[line_len - 1] == ' ' || line[line_len - 1] == '\t')) {
-            line[line_len - 1] = '\0';
-            line_len--;
+    /* Extract complete newline-terminated command lines */
+    while (1) {
+        char *nl = memchr(client->rx_buf, '\n', client->rx_len);
+        if (nl == NULL) {
+            break;
         }
 
-        if (line[0] != '\0') {
-            int res = process_client_command(client, line);
+        size_t line_len = (size_t)(nl - client->rx_buf);
+        char cmd[BUFFER_SIZE];
+        if (line_len < sizeof(cmd)) {
+            memcpy(cmd, client->rx_buf, line_len);
+            cmd[line_len] = '\0';
+        } else {
+            memcpy(cmd, client->rx_buf, sizeof(cmd) - 1);
+            cmd[sizeof(cmd) - 1] = '\0';
+        }
+
+        /* Shift remaining stream bytes to front */
+        size_t consumed = line_len + 1;
+        size_t remaining = client->rx_len - consumed;
+        if (remaining > 0) {
+            memmove(client->rx_buf, nl + 1, remaining);
+        }
+        client->rx_len = remaining;
+        client->rx_buf[client->rx_len] = '\0';
+
+        /* Trim trailing CR or whitespace */
+        size_t clen = strlen(cmd);
+        while (clen > 0 && (cmd[clen - 1] == '\r' || cmd[clen - 1] == ' ' || cmd[clen - 1] == '\t')) {
+            cmd[clen - 1] = '\0';
+            clen--;
+        }
+
+        char *p = cmd;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+
+        if (*p != '\0') {
+            int res = process_client_command(client, p);
             if (res == 1) {
                 if (close(client->fd) < 0) {
                     perror("close client socket");
                 }
                 client->fd = -1;
+                client->rx_len = 0;
                 return 0;
             } else if (res < 0) {
                 return -1;
             }
         }
-        line = strtok_r(NULL, "\r\n", &saveptr);
     }
 
     return 0;
@@ -429,10 +473,91 @@ static int broadcast_status(client_t clients[], size_t max_clients) {
     for (i = 0; i < max_clients; ++i) {
         if (clients[i].fd != -1) {
             if (send_all(clients[i].fd, msg, (size_t)len) < 0) {
+                if (printf("[Server] Client %d dropped (broadcast error)\n", clients[i].client_id) < 0) {
+                    perror("printf");
+                }
+                if (fflush(stdout) != 0) {
+                    perror("fflush");
+                }
                 if (close(clients[i].fd) < 0) {
                     perror("close dropped client");
                 }
                 clients[i].fd = -1;
+                clients[i].rx_len = 0;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Main event loop multiplexing server socket, clients, and periodic broadcast.
+ * Returns 0 on success, -1 on failure.
+ */
+static int run_server_loop(int server_fd, client_t clients[], size_t max_clients, int *next_id) {
+    time_t last_broadcast = time(NULL);
+    if (last_broadcast == (time_t)-1) {
+        perror("time");
+        last_broadcast = 0;
+    }
+
+    while (g_running) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(server_fd, &readfds);
+        int max_fd = server_fd;
+
+        size_t i;
+        for (i = 0; i < max_clients; ++i) {
+            if (clients[i].fd != -1) {
+                FD_SET(clients[i].fd, &readfds);
+                if (clients[i].fd > max_fd) {
+                    max_fd = clients[i].fd;
+                }
+            }
+        }
+
+        struct timeval tv;
+        tv.tv_sec = SELECT_TIMEOUT_SEC;
+        tv.tv_usec = SELECT_TIMEOUT_USEC;
+
+        int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
+
+        if (activity < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("select");
+            return -1;
+        }
+
+        /* Check for new connection */
+        if (activity > 0 && FD_ISSET(server_fd, &readfds)) {
+            if (handle_new_connection(server_fd, clients, max_clients, next_id) < 0) {
+                return -1;
+            }
+        }
+
+        /* Check client sockets */
+        if (activity > 0) {
+            for (i = 0; i < max_clients; ++i) {
+                if (clients[i].fd != -1 && FD_ISSET(clients[i].fd, &readfds)) {
+                    if (handle_client_data(&clients[i]) < 0) {
+                        return -1;
+                    }
+                }
+            }
+        }
+
+        /* Periodic broadcast */
+        time_t current_time = time(NULL);
+        if (current_time != (time_t)-1) {
+            if (current_time - last_broadcast >= BROADCAST_INTERVAL) {
+                if (broadcast_status(clients, max_clients) < 0) {
+                    fprintf(stderr, "Broadcast failed\n");
+                }
+                last_broadcast = current_time;
             }
         }
     }
@@ -500,77 +625,12 @@ int main(void) {
         perror("fflush");
     }
 
-    time_t last_broadcast = time(NULL);
-    if (last_broadcast == (time_t)-1) {
-        perror("time");
-        last_broadcast = 0;
-    }
-
     int next_client_id = CLIENT_ID_START;
-
-    while (g_running) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(server_fd, &readfds);
-        int max_fd = server_fd;
-
-        size_t i;
-        for (i = 0; i < MAX_CLIENTS; ++i) {
-            if (clients[i].fd != -1) {
-                FD_SET(clients[i].fd, &readfds);
-                if (clients[i].fd > max_fd) {
-                    max_fd = clients[i].fd;
-                }
-            }
-        }
-
-        struct timeval tv;
-        tv.tv_sec = SELECT_TIMEOUT_SEC;
-        tv.tv_usec = SELECT_TIMEOUT_USEC;
-
-        int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
-
-        if (activity < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("select");
-            break;
-        }
-
-        /* Check for new connection */
-        if (activity > 0 && FD_ISSET(server_fd, &readfds)) {
-            if (handle_new_connection(server_fd, clients, MAX_CLIENTS, &next_client_id) < 0) {
-                break;
-            }
-        }
-
-        /* Check client sockets */
-        if (activity > 0) {
-            for (i = 0; i < MAX_CLIENTS; ++i) {
-                if (clients[i].fd != -1 && FD_ISSET(clients[i].fd, &readfds)) {
-                    if (handle_client_data(&clients[i]) < 0) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        /* Periodic broadcast */
-        time_t current_time = time(NULL);
-        if (current_time != (time_t)-1) {
-            if (current_time - last_broadcast >= BROADCAST_INTERVAL) {
-                if (broadcast_status(clients, MAX_CLIENTS) < 0) {
-                    fprintf(stderr, "Broadcast failed\n");
-                }
-                last_broadcast = current_time;
-            }
-        }
-    }
+    int res = run_server_loop(server_fd, clients, MAX_CLIENTS, &next_client_id);
 
     if (cleanup_server(server_fd, clients, MAX_CLIENTS) < 0) {
         return EXIT_FAILURE;
     }
 
-    return EXIT_SUCCESS;
+    return (res < 0) ? EXIT_FAILURE : EXIT_SUCCESS;
 }

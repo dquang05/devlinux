@@ -135,10 +135,10 @@ static int init_unix_socket(const char *path) {
 }
 
 /*
- * Open or create the monitored status file and record its initial size.
+ * Open or create the monitored status file and record initial size and inode.
  * Returns file descriptor on success, -1 on error.
  */
-static int init_monitored_file(const char *path, off_t *initial_size) {
+static int init_monitored_file(const char *path, off_t *initial_size, ino_t *initial_inode) {
     int fd = open(path, O_CREAT | O_RDWR, FILE_PERMS);
     if (fd < 0) {
         perror("open monitored file");
@@ -155,6 +155,7 @@ static int init_monitored_file(const char *path, off_t *initial_size) {
     }
 
     *initial_size = st.st_size;
+    *initial_inode = st.st_ino;
     return fd;
 }
 
@@ -187,6 +188,7 @@ static int send_all(int fd, const char *buf, size_t len) {
 
 /*
  * Process messages read from FIFO.
+ * Handles non-blocking read and skips when EAGAIN/EWOULDBLOCK.
  * Returns 0 on success, -1 on error.
  */
 static int handle_fifo_event(int fifo_fd, int monitoring_active, long *total_events) {
@@ -196,6 +198,10 @@ static int handle_fifo_event(int fifo_fd, int monitoring_active, long *total_eve
     ssize_t bytes_read = read(fifo_fd, buf, sizeof(buf) - 1);
     if (bytes_read <= 0) {
         if (bytes_read < 0) {
+            /*
+             * With O_NONBLOCK, if no data is ready yet, the kernel returns EAGAIN or EWOULDBLOCK.
+             * This is normal non-blocking behavior and should not be treated as fatal.
+             */
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 return 0;
             }
@@ -310,16 +316,41 @@ static int handle_client_activity(int client_fd, int *monitoring_active,
 
 /*
  * Check if the monitored file size has changed.
+ * Also checks inode change and reopens descriptor if file was recreated.
  * Returns 0 on success, -1 on error.
  */
-static int check_file_change(const char *path, off_t *last_size, int monitoring_active, long *total_events) {
+static int check_file_change(const char *path, off_t *last_size, ino_t *last_inode,
+                             int monitoring_active, long *total_events, int *file_fd) {
     struct stat st;
     if (stat(path, &st) < 0) {
         if (errno == ENOENT) {
+            /* File removed: close old descriptor if still open */
+            if (*file_fd >= 0) {
+                if (close(*file_fd) < 0) {
+                    perror("close removed file");
+                }
+                *file_fd = -1;
+            }
+            *last_size = 0;
+            *last_inode = 0;
             return 0;
         }
         perror("stat monitored file");
         return -1;
+    }
+
+    /* File recreated or opened after deletion */
+    if (*file_fd < 0 || st.st_ino != *last_inode) {
+        if (*file_fd >= 0) {
+            if (close(*file_fd) < 0) {
+                perror("close old inode file");
+            }
+        }
+        *file_fd = open(path, O_RDWR, FILE_PERMS);
+        if (*file_fd < 0) {
+            perror("reopen recreated file");
+        }
+        *last_inode = st.st_ino;
     }
 
     if (st.st_size != *last_size) {
@@ -339,19 +370,169 @@ static int check_file_change(const char *path, off_t *last_size, int monitoring_
 }
 
 /*
- * Clean up all descriptors and files upon shutdown.
- * Returns 0 on success.
+ * Initialize all monitor system resources: FIFO, socket, and target file.
+ * Returns 0 on success, -1 on failure.
  */
-static int cleanup_monitor(int fifo_fd, int sock_fd, int client_fd, int file_fd, const char *sock_path) {
-    if (fifo_fd >= 0) {
-        if (close(fifo_fd) < 0) {
-            perror("close FIFO");
+static int init_monitor_resources(int *fifo_fd, int *sock_fd, int *file_fd,
+                                  off_t *last_file_size, ino_t *last_inode, time_t *start_time) {
+    *start_time = time(NULL);
+    if (*start_time == (time_t)-1) {
+        perror("time");
+        *start_time = 0;
+    }
+
+    *fifo_fd = init_fifo(FIFO_PATH);
+    if (*fifo_fd < 0) {
+        return -1;
+    }
+
+    *sock_fd = init_unix_socket(SOCKET_PATH);
+    if (*sock_fd < 0) {
+        if (close(*fifo_fd) < 0) {
+            perror("close");
+        }
+        *fifo_fd = -1;
+        return -1;
+    }
+
+    *file_fd = init_monitored_file(FILE_PATH, last_file_size, last_inode);
+    if (*file_fd < 0) {
+        if (close(*fifo_fd) < 0) {
+            perror("close");
+        }
+        if (close(*sock_fd) < 0) {
+            perror("close");
+        }
+        *fifo_fd = -1;
+        *sock_fd = -1;
+        return -1;
+    }
+
+    if (printf("[Monitor] Listening on %s\n", SOCKET_PATH) < 0) {
+        perror("printf");
+    }
+    if (printf("[Monitor] Monitoring %s (FIFO) and %s\n", FIFO_PATH, FILE_PATH) < 0) {
+        perror("printf");
+    }
+    if (fflush(stdout) != 0) {
+        perror("fflush");
+    }
+
+    return 0;
+}
+
+/*
+ * Main event loop multiplexing FIFO, Unix domain socket, and file status.
+ * Returns 0 on clean exit, -1 on error.
+ */
+static int run_monitor_loop(int fifo_fd, int sock_fd, int *file_fd,
+                            off_t *last_file_size, ino_t *last_inode, time_t start_time) {
+    struct pollfd fds[MAX_POLL_FDS];
+    fds[FD_FIFO].fd = fifo_fd;
+    fds[FD_FIFO].events = POLLIN;
+
+    fds[FD_SOCKET_LISTENER].fd = sock_fd;
+    fds[FD_SOCKET_LISTENER].events = POLLIN;
+
+    fds[FD_FILE].fd = *file_fd;
+    fds[FD_FILE].events = POLLERR;
+
+    int client_fd = -1;
+    fds[FD_CLIENT].fd = -1;
+    fds[FD_CLIENT].events = POLLIN;
+
+    int monitoring_active = MONITOR_ACTIVE_INIT;
+    long total_events = 0;
+
+    while (g_running) {
+        fds[FD_FILE].fd = *file_fd;
+        fds[FD_CLIENT].fd = client_fd;
+        nfds_t nfds = (client_fd >= 0) ? MAX_POLL_FDS : STATIC_POLL_FDS;
+
+        int poll_ret = poll(fds, nfds, POLL_TIMEOUT_MS);
+
+        if (poll_ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            if (client_fd >= 0) {
+                if (close(client_fd) < 0) {
+                    perror("close remaining client");
+                }
+            }
+            return -1;
+        }
+
+        if (poll_ret == 0) {
+            /* Heartbeat timeout */
+            if (printf("[HEARTBEAT] Monitor alive, events_seen=%ld\n", total_events) < 0) {
+                perror("printf");
+            }
+            if (fflush(stdout) != 0) {
+                perror("fflush");
+            }
+        } else {
+            /* 1. Check FIFO events */
+            if (fds[FD_FIFO].revents & POLLIN) {
+                if (handle_fifo_event(fifo_fd, monitoring_active, &total_events) < 0) {
+                    perror("handle_fifo_event");
+                }
+            }
+
+            /* 2. Check Socket listener for new connections */
+            if (fds[FD_SOCKET_LISTENER].revents & POLLIN) {
+                int new_client = accept(sock_fd, NULL, NULL);
+                if (new_client >= 0) {
+                    if (client_fd >= 0) {
+                        /* Close old client with error check */
+                        if (close(client_fd) < 0) {
+                            perror("close old client");
+                        }
+                    }
+                    client_fd = new_client;
+                } else {
+                    if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        perror("accept");
+                    }
+                }
+            }
+
+            /* 3. Check active client for incoming commands */
+            if (client_fd >= 0 && (fds[FD_CLIENT].revents & (POLLIN | POLLHUP | POLLERR))) {
+                int res = handle_client_activity(client_fd, &monitoring_active, total_events, start_time);
+                if (res != 0) {
+                    if (close(client_fd) < 0) {
+                        perror("close client socket");
+                    }
+                    client_fd = -1;
+                }
+            }
+        }
+
+        /* Check for changes in monitored file size or recreation */
+        if (check_file_change(FILE_PATH, last_file_size, last_inode, monitoring_active, &total_events, file_fd) < 0) {
+            perror("check_file_change");
         }
     }
 
     if (client_fd >= 0) {
         if (close(client_fd) < 0) {
-            perror("close client socket");
+            perror("close remaining client");
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Clean up all descriptors and files upon shutdown.
+ * Returns 0 on success.
+ */
+static int cleanup_monitor(int fifo_fd, int sock_fd, int file_fd, const char *sock_path) {
+    if (fifo_fd >= 0) {
+        if (close(fifo_fd) < 0) {
+            perror("close FIFO");
         }
     }
 
@@ -393,132 +574,22 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    time_t start_time = time(NULL);
-    if (start_time == (time_t)-1) {
-        perror("time");
-        start_time = 0;
-    }
-
-    int fifo_fd = init_fifo(FIFO_PATH);
-    if (fifo_fd < 0) {
-        return EXIT_FAILURE;
-    }
-
-    int sock_fd = init_unix_socket(SOCKET_PATH);
-    if (sock_fd < 0) {
-        if (close(fifo_fd) < 0) {
-            perror("close");
-        }
-        return EXIT_FAILURE;
-    }
-
+    int fifo_fd = -1;
+    int sock_fd = -1;
+    int file_fd = -1;
     off_t last_file_size = 0;
-    int file_fd = init_monitored_file(FILE_PATH, &last_file_size);
-    if (file_fd < 0) {
-        if (close(fifo_fd) < 0) {
-            perror("close");
-        }
-        if (close(sock_fd) < 0) {
-            perror("close");
-        }
+    ino_t last_inode = 0;
+    time_t start_time = 0;
+
+    if (init_monitor_resources(&fifo_fd, &sock_fd, &file_fd, &last_file_size, &last_inode, &start_time) < 0) {
         return EXIT_FAILURE;
     }
 
-    if (printf("[Monitor] Listening on %s\n", SOCKET_PATH) < 0) {
-        perror("printf");
-    }
-    if (printf("[Monitor] Monitoring %s (FIFO) and %s\n", FIFO_PATH, FILE_PATH) < 0) {
-        perror("printf");
-    }
-    if (fflush(stdout) != 0) {
-        perror("fflush");
-    }
+    int res = run_monitor_loop(fifo_fd, sock_fd, &file_fd, &last_file_size, &last_inode, start_time);
 
-    struct pollfd fds[NUM_POLL_FDS];
-    fds[FD_FIFO].fd = fifo_fd;
-    fds[FD_FIFO].events = POLLIN;
-
-    fds[FD_SOCKET_LISTENER].fd = sock_fd;
-    fds[FD_SOCKET_LISTENER].events = POLLIN;
-
-    fds[FD_FILE].fd = file_fd;
-    fds[FD_FILE].events = POLLERR; /* Just track descriptor, check via stat */
-
-    int client_fd = -1;
-    fds[FD_CLIENT].fd = -1;
-    fds[FD_CLIENT].events = POLLIN;
-
-    int monitoring_active = MONITOR_ACTIVE_INIT;
-    long total_events = 0;
-
-    while (g_running) {
-        fds[FD_CLIENT].fd = client_fd;
-
-        int poll_ret = poll(fds, NUM_POLL_FDS, POLL_TIMEOUT_MS);
-
-        if (poll_ret < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("poll");
-            break;
-        }
-
-        if (poll_ret == 0) {
-            /* Heartbeat timeout */
-            if (printf("[HEARTBEAT] Monitor alive, events_seen=%ld\n", total_events) < 0) {
-                perror("printf");
-            }
-            if (fflush(stdout) != 0) {
-                perror("fflush");
-            }
-        } else {
-            /* 1. Check FIFO events */
-            if (fds[FD_FIFO].revents & POLLIN) {
-                if (handle_fifo_event(fifo_fd, monitoring_active, &total_events) < 0) {
-                    perror("handle_fifo_event");
-                }
-            }
-
-            /* 2. Check Socket listener for new connections */
-            if (fds[FD_SOCKET_LISTENER].revents & POLLIN) {
-                int new_client = accept(sock_fd, NULL, NULL);
-                if (new_client >= 0) {
-                    if (client_fd >= 0) {
-                        /* Replace previous active client */
-                        if (close(client_fd) < 0) {
-                            perror("close old client");
-                        }
-                    }
-                    client_fd = new_client;
-                } else {
-                    if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        perror("accept");
-                    }
-                }
-            }
-
-            /* 3. Check active client for incoming commands */
-            if (client_fd >= 0 && (fds[FD_CLIENT].revents & (POLLIN | POLLHUP | POLLERR))) {
-                int res = handle_client_activity(client_fd, &monitoring_active, total_events, start_time);
-                if (res != 0) {
-                    if (close(client_fd) < 0) {
-                        perror("close client socket");
-                    }
-                    client_fd = -1;
-                }
-            }
-        }
-
-        /* Check for changes in monitored file size */
-        if (check_file_change(FILE_PATH, &last_file_size, monitoring_active, &total_events) < 0) {
-            perror("check_file_change");
-        }
-    }
-
-    if (cleanup_monitor(fifo_fd, sock_fd, client_fd, file_fd, SOCKET_PATH) < 0) {
+    if (cleanup_monitor(fifo_fd, sock_fd, file_fd, SOCKET_PATH) < 0) {
         return EXIT_FAILURE;
     }
 
-    return EXIT_SUCCESS;
+    return (res < 0) ? EXIT_FAILURE : EXIT_SUCCESS;
 }

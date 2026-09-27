@@ -11,12 +11,14 @@
 #define BUFFER_SIZE         512
 #define BACKLOG             5
 
+#define STATIC_POLL_FDS     3
+#define MAX_POLL_FDS        4
+
 typedef enum {
     FD_FIFO = 0,
     FD_SOCKET_LISTENER = 1,
     FD_FILE = 2,
-    FD_CLIENT = 3,
-    NUM_POLL_FDS = 4
+    FD_CLIENT = 3
 } pollfd_index_t;
 
 #endif /* EVENT_MONITOR_H */

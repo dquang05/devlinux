@@ -1,6 +1,7 @@
 #ifndef IOT_SERVER_H
 #define IOT_SERVER_H
 
+#include <stdint.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/select.h>
@@ -28,12 +29,14 @@
 
 /* Client context structure */
 typedef struct {
-    int     fd;            /* Socket file descriptor (-1 if slot is free) */
-    int     mode;          /* 0=idle, 1=active, 2=alert */
-    time_t  last_activity; /* Timestamp of most recent activity */
-    int     client_id;     /* 1-based sequential ID */
-    char    ip[64];        /* Client IP string */
-    int     port;          /* Client port */
+    int      fd;                  /* Socket file descriptor (-1 if slot is free) */
+    int      mode;                /* 0=idle, 1=active, 2=alert */
+    time_t   last_activity;       /* Timestamp of most recent activity */
+    int      client_id;           /* 1-based sequential ID */
+    char     ip[64];              /* Client IP string */
+    uint16_t port;                /* Client port (type-safe) */
+    char     rx_buf[BUFFER_SIZE]; /* Linear buffer for stream partial reads */
+    size_t   rx_len;              /* Number of valid bytes in rx_buf */
 } client_t;
 
 #endif /* IOT_SERVER_H */
